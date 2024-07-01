@@ -1,13 +1,44 @@
-use std::sync::{Arc, Mutex};
+use std::{sync::{Arc, Mutex}, vec};
 
 use glium::{implement_vertex, uniform, Surface};
 use sysinfo::System;
 use tokio::time::sleep;
 
+#[derive(Copy, Clone, Debug)]
+struct Vertex {
+    position: [f32; 2],
+}
+
+fn make_bar(idx: u16, width:f32) -> [Vertex; 4] {
+    let x0: f32 = ((1 + idx) as f32 * width) - 1.0;
+    let x1: f32 = ((2 + idx) as f32 * width) - 1.0;
+    let y0 = -0.7;
+    let y1 = -0.8;
+    [
+        Vertex { position: [x0,  y0] },
+        Vertex { position: [x1,  y0] },
+        Vertex { position: [x0, y1] },
+        Vertex { position: [x1, y1] },
+    ]
+}
+
+fn make_bars(len: u16) -> Vec<[Vertex; 4]> {
+    let mut bars = vec![];
+    let width = 2.0 / ((len + 1) * 2) as f32;
+    for i in 0..=len {
+        bars.push(make_bar(i * 2, width));
+    }
+    bars
+}
+
 #[tokio::main]
 async fn main() {
     let mut sys = System::new_all();
-    let cpu_usage = Arc::new(Mutex::new(0.0));
+
+    // kept it here to avoid cloning sys in the tokio::spawn block
+    let shapes = make_bars(sys.cpus().len() as u16);
+    // println!("shape: {:?}", shapes);
+    let cpu_usage = Arc::new(Mutex::new(vec![0.0]));
     let cpu_usage_clone = Arc::clone(&cpu_usage);
 
     tokio::spawn(async move {
@@ -15,9 +46,9 @@ async fn main() {
         loop {
             interval.tick().await;
             sys.refresh_cpu(); // Refreshing CPU information.
-            let mut usage = 0.0;
+            let mut usage = vec![];
             for cpu in sys.cpus() {
-                usage += cpu.cpu_usage();
+                usage.push(cpu.cpu_usage());
             }
             // usage /= sys.cpus().len() as f32;
             *cpu_usage.lock().unwrap() = usage;
@@ -28,20 +59,13 @@ async fn main() {
     });
 
     let event_loop = winit::event_loop::EventLoopBuilder::new().build().expect("event loop building");
-    let (window, display) = glium::backend::glutin::SimpleWindowBuilder::new().with_inner_size(1600, 1600).build(&event_loop);
+    let (window, display) = glium::backend::glutin::SimpleWindowBuilder::new().with_inner_size(800, 600).build(&event_loop);
 
-    #[derive(Copy, Clone)]
-    struct Vertex {
-        position: [f32; 2],
-    }
     implement_vertex!(Vertex, position);
-    let shape = vec![
-        Vertex { position: [-0.5,  1.0] },
-        Vertex { position: [ 0.5,  1.0] },
-        Vertex { position: [-0.5, -1.0] },
-        Vertex { position: [ 0.5, -1.0] },
-    ];
-    let vertex_buffer = glium::VertexBuffer::new(&display, &shape).unwrap();
+    
+    let vertex_buffers = shapes.iter().map(|shape| {
+        glium::VertexBuffer::new(&display, shape).unwrap()
+    }).collect::<Vec<_>>();
     let indices = glium::index::NoIndices(glium::index::PrimitiveType::TriangleStrip);
 
     let vertex_shader_src = r#"
@@ -52,8 +76,8 @@ async fn main() {
 
         void main() {
             vec2 pos = position;
-            if (pos.y > -1.0) {
-                pos.y = y_off;
+            if (pos.y > -0.8) {
+                pos.y = (y_off / 100.0) - 0.8;
             }
             gl_Position = vec4(pos, 0.0, 1.0);
         }
@@ -78,14 +102,18 @@ async fn main() {
                 },
                 // We now need to render everyting in response to a RedrawRequested event due to the animation
                 winit::event::WindowEvent::RedrawRequested => {
-                    let y_off = (*cpu_usage_clone.lock().unwrap() / 100.0) - 1.0;
-                    print!("\n{}% ", y_off);
+                    let cpu_usages = (*cpu_usage_clone.lock().unwrap()).clone();
+                    // let y_offs = cpu_usages.iter().map(|usage| (usage / 100.0) - 1.0).collect::<Vec<f32>>();
+                    // println!("\n{}% ", y_offs);
 
                     let mut target = display.draw();
                     target.clear_color(0.0, 0.0, 1.0, 1.0);
-                    let uniforms = uniform! { y_off: y_off };
-                    target.draw(&vertex_buffer, &indices, &program, &uniforms,
-                                &Default::default()).unwrap();
+
+                    vertex_buffers.iter().zip(cpu_usages.iter()).for_each(|(vertex_buffer, y_off)| {
+                        let uniform = uniform! { y_off: *y_off };
+                        target.draw(vertex_buffer, &indices, &program, &uniform, &Default::default()).unwrap();
+                    });
+
                     target.finish().unwrap();
                 },
                 // Because glium doesn't know about windows we need to resize the display
